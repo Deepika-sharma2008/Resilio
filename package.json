@@ -1,0 +1,12 @@
+
+{
+  "name": "resilio",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n BACKEND,FRONTEND -c green,blue \"npm run dev --prefix Backend\" \"npm run dev --prefix Frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
+  }
+}
