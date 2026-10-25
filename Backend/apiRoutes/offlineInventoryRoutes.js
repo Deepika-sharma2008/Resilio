@@ -1,4 +1,3 @@
-
 const express = require("express");
 const router = express.Router();
 
@@ -7,6 +6,7 @@ const StockBatch = require("../datamodels/StockBatch");
 const StockQuantity = require("../datamodels/StockQuantity");
 
 const syncedOperations = new Map();
+const inFlightOperations = new Map();
 
 function generateBatchCode() {
   return `OFF-${Date.now()}-${Math.random()
@@ -23,9 +23,7 @@ async function generateIngredientCode() {
   const largest = ingredients.reduce((max, item) => {
     const match = item.ingredientCode?.match(/^ING-(\d+)$/i);
 
-    return match
-      ? Math.max(max, Number(match[1]))
-      : max;
+    return match ? Math.max(max, Number(match[1])) : max;
   }, 0);
 
   return `ING-${String(largest + 1).padStart(3, "0")}`;
@@ -40,24 +38,24 @@ router.post("/offline-sync", async (req, res) => {
     category = "Vegetables",
     minimumStock = 5,
     ingredientCode,
-  } = req.body;
+  } = req.body || {};
 
-  const normalizedUnit =
-    unit === "pcs" ? "piece" : unit;
+  const normalizedUnit = unit === "pcs" ? "piece" : unit;
 
   if (
-    !operationId ||
+    typeof operationId !== "string" ||
+    !operationId.trim() ||
     typeof ingredientName !== "string" ||
     !ingredientName.trim()
   ) {
     return res.status(400).json({
       success: false,
-      message:
-        "Operation ID and ingredient name are required.",
+      message: "Operation ID and ingredient name are required.",
     });
   }
 
   const amount = Number(quantity);
+  const minimum = Number(minimumStock);
 
   if (!Number.isFinite(amount) || amount <= 0) {
     return res.status(400).json({
@@ -66,13 +64,14 @@ router.post("/offline-sync", async (req, res) => {
     });
   }
 
-  const allowedUnits = [
-    "kg",
-    "g",
-    "litre",
-    "ml",
-    "piece",
-  ];
+  if (!Number.isFinite(minimum) || minimum < 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Minimum stock must be zero or greater.",
+    });
+  }
+
+  const allowedUnits = ["kg", "g", "litre", "ml", "piece"];
 
   if (!allowedUnits.includes(normalizedUnit)) {
     return res.status(400).json({
@@ -81,15 +80,38 @@ router.post("/offline-sync", async (req, res) => {
     });
   }
 
-  if (syncedOperations.has(operationId)) {
+  const operationKey = operationId.trim();
+
+  // Return the previous result if this operation has already completed.
+  if (syncedOperations.has(operationKey)) {
     return res.status(200).json({
       success: true,
       message: "This operation was already processed.",
-      data: syncedOperations.get(operationId),
+      data: syncedOperations.get(operationKey),
+      alreadyProcessed: true,
     });
   }
 
-  try {
+  // Avoid two concurrent requests processing the same operation.
+  if (inFlightOperations.has(operationKey)) {
+    try {
+      const result = await inFlightOperations.get(operationKey);
+
+      return res.status(200).json({
+        success: true,
+        message: "Inventory operation processed.",
+        data: result,
+        alreadyProcessed: true,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        message: error.message || "Inventory sync failed.",
+      });
+    }
+  }
+
+  const operationPromise = (async () => {
     const normalizedName = ingredientName.trim();
 
     const escapedName = normalizedName.replace(
@@ -114,15 +136,20 @@ router.post("/offline-sync", async (req, res) => {
         name: normalizedName,
         category,
         unit: normalizedUnit,
-        minimumStock: Number(minimumStock) || 5,
+        minimumStock: minimum,
       });
-    } else if (ingredient.unit !== normalizedUnit) {
-      return res.status(409).json({
-        success: false,
-        message:
-          `The existing ingredient uses ${ingredient.unit}, ` +
-          `not ${normalizedUnit}.`,
-      });
+    } else {
+      if (ingredient.unit !== normalizedUnit) {
+        throw new Error(
+          `The existing ingredient uses ${ingredient.unit}, not ${normalizedUnit}.`
+        );
+      }
+
+      if (ingredient.isActive === false) {
+        throw new Error(
+          "This ingredient is inactive. Reactivate it before adding stock."
+        );
+      }
     }
 
     const batch = await StockBatch.create({
@@ -133,7 +160,7 @@ router.post("/offline-sync", async (req, res) => {
       unitCost: 0,
       totalCost: 0,
       receivedDate: new Date(),
-      status: "Available",
+      status: "ACTIVE",
     });
 
     const stock = await StockQuantity.findOneAndUpdate(
@@ -150,7 +177,7 @@ router.post("/offline-sync", async (req, res) => {
       }
     );
 
-    const result = {
+    return {
       ingredientId: ingredient._id,
       ingredientName: ingredient.name,
       unit: normalizedUnit,
@@ -158,8 +185,14 @@ router.post("/offline-sync", async (req, res) => {
       batchId: batch._id,
       totalQuantity: stock.totalQuantity,
     };
+  })();
 
-    syncedOperations.set(operationId, result);
+  inFlightOperations.set(operationKey, operationPromise);
+
+  try {
+    const result = await operationPromise;
+
+    syncedOperations.set(operationKey, result);
 
     return res.status(200).json({
       success: true,
@@ -167,21 +200,14 @@ router.post("/offline-sync", async (req, res) => {
       data: result,
     });
   } catch (error) {
-    console.error(
-      "Offline inventory sync error:",
-      error
-    );
+    console.error("Offline inventory sync error:", error);
 
-    return res.status(
-      error.code === 11000 ? 409 : 500
-    ).json({
+    return res.status(500).json({
       success: false,
-      message:
-        error.code === 11000
-          ? "A duplicate ingredient or batch code was detected."
-          : error.message ||
-            "Offline inventory sync failed.",
+      message: error.message || "Offline inventory sync failed.",
     });
+  } finally {
+    inFlightOperations.delete(operationKey);
   }
 });
 

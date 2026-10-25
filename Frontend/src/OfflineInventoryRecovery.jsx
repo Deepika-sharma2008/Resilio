@@ -1,10 +1,11 @@
-
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./OfflineInventoryRecovery.css";
 
 const DB_NAME = "resilio-offline-inventory";
 const STORE_NAME = "pending-operations";
 const SYNC_ENDPOINT = "/api/admin/inventory/offline-sync";
+const RETRY_INTERVAL = 5000;
+const DEMO_RECOVERY_DELAY = 15000;
 
 function openQueueDB() {
   return new Promise((resolve, reject) => {
@@ -21,8 +22,9 @@ function openQueueDB() {
     };
 
     request.onsuccess = () => resolve(request.result);
+
     request.onerror = () =>
-      reject(request.error || new Error("Could not open local offline queue."));
+      reject(request.error || new Error("Could not open offline queue."));
   });
 }
 
@@ -72,11 +74,9 @@ const removePending = (id) =>
   queueRequest("readwrite", (store) => store.delete(id));
 
 function makeId() {
-  if (globalThis.crypto?.randomUUID) {
-    return globalThis.crypto.randomUUID();
-  }
-
-  return `op-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `op-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function formatTime(value) {
@@ -94,25 +94,39 @@ export default function OfflineInventoryRecovery() {
   const [ingredient, setIngredient] = useState("Tomato");
   const [quantity, setQuantity] = useState("5");
   const [unit, setUnit] = useState("kg");
-  const [realOnline, setRealOnline] = useState(navigator.onLine);
+
+  const [realOnline, setRealOnline] = useState(
+    () => navigator.onLine
+  );
+
   const [simulateOffline, setSimulateOffline] = useState(false);
+  const [demoRunning, setDemoRunning] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [notice, setNotice] = useState("");
 
   const [events, setEvents] = useState([
     {
-      label: "Offline sync monitor ready",
+      label: "Automatic recovery monitor started",
       time: new Date().toISOString(),
       kind: "info",
     },
   ]);
 
   const syncingRef = useRef(false);
+  const demoTimerRef = useRef(null);
+
   const offline = !realOnline || simulateOffline;
 
   const addEvent = useCallback((label, kind = "info") => {
     setEvents((previous) =>
-      [...previous, { label, kind, time: new Date().toISOString() }].slice(-30)
+      [
+        ...previous,
+        {
+          label,
+          kind,
+          time: new Date().toISOString(),
+        },
+      ].slice(-30)
     );
   }, []);
 
@@ -132,65 +146,22 @@ export default function OfflineInventoryRecovery() {
     }
   }, []);
 
-  const deletePendingItem = useCallback(
-    async (operationId) => {
-      const confirmed = window.confirm(
-        "Remove this item from the local pending queue? This will not update MongoDB."
-      );
-
-      if (!confirmed) return;
-
-      try {
-        await removePending(operationId);
-        await refreshQueue();
-
-        addEvent("Pending queue item removed manually", "warning");
-        setNotice("Queue item removed successfully.");
-      } catch (error) {
-        setNotice(`Delete failed: ${error.message}`);
-      }
-    },
-    [refreshQueue, addEvent]
-  );
-
-  useEffect(() => {
-    refreshQueue();
-
-    const onlineHandler = () => {
-      setRealOnline(true);
-      addEvent("Network connection restored — automatic sync starting", "success");
-    };
-
-    const offlineHandler = () => {
-      setRealOnline(false);
-      addEvent(
-        "Network connection lost — new entries will be queued",
-        "warning"
-      );
-    };
-
-    window.addEventListener("online", onlineHandler);
-    window.addEventListener("offline", offlineHandler);
-
-    return () => {
-      window.removeEventListener("online", onlineHandler);
-      window.removeEventListener("offline", offlineHandler);
-    };
-  }, [refreshQueue, addEvent]);
-
   const pendingCount = useMemo(
     () => items.filter((item) => item.status !== "SYNCED").length,
     [items]
   );
 
   const syncQueue = useCallback(async () => {
-    if (syncingRef.current || !navigator.onLine || simulateOffline) {
+    if (
+      syncingRef.current ||
+      !navigator.onLine ||
+      simulateOffline
+    ) {
       return;
     }
 
     syncingRef.current = true;
     setSyncing(true);
-    setNotice("");
 
     try {
       const pending = (await getAllPending())
@@ -202,15 +173,18 @@ export default function OfflineInventoryRecovery() {
         );
 
       if (pending.length === 0) {
-        addEvent("Sync check complete — no pending inventory items", "success");
-        setNotice("Queue is clear. No pending items to sync.");
         return;
       }
 
-      addEvent(`Sync started for ${pending.length} pending item(s)`);
+      addEvent(
+        `Automatic sync started for ${pending.length} pending item(s)`,
+        "info"
+      );
 
       for (const item of pending) {
-        if (!navigator.onLine || simulateOffline) break;
+        if (!navigator.onLine || simulateOffline) {
+          break;
+        }
 
         const attempt = {
           ...item,
@@ -245,26 +219,15 @@ export default function OfflineInventoryRecovery() {
 
           const payload = await response.json().catch(() => ({}));
 
-          if (!response.ok) {
-            if (response.status === 404) {
-              throw new Error(
-                `HTTP 404: Backend route ${SYNC_ENDPOINT} not found. Check your Express route.`
-              );
-            }
-
+          if (!response.ok || payload.success !== true) {
             throw new Error(
-              payload.message || `Server returned HTTP ${response.status}`
+              payload.message ||
+              `Server returned HTTP ${response.status}`
             );
           }
 
-          if (payload.success === false) {
-            throw new Error(payload.message || "Server could not save the inventory item.");
-          }
-
-          // Remove the local entry only after the server confirms success.
           await removePending(item.operationId);
 
-          // Notify the Ingredients page to fetch the latest database data.
           window.dispatchEvent(
             new CustomEvent("resilio:inventory-synced", {
               detail: {
@@ -281,11 +244,6 @@ export default function OfflineInventoryRecovery() {
             `${item.ingredientName}: ${item.quantity} ${item.unit} synced successfully`,
             "success"
           );
-
-          addEvent(
-            "Database sync confirmed — Ingredients page refresh event sent",
-            "success"
-          );
         } catch (error) {
           await savePending({
             ...attempt,
@@ -294,12 +252,13 @@ export default function OfflineInventoryRecovery() {
           });
 
           addEvent(
-            `${item.ingredientName} sync failed: ${error.message}`,
+            `${item.ingredientName}: sync failed — ${error.message}`,
             "error"
           );
 
           setNotice(
-            `Sync pending: ${error.message}. Item remains in the local queue.`
+            `Sync failed. Automatic retry will run in ${RETRY_INTERVAL / 1000
+            } seconds. ${error.message}`
           );
 
           break;
@@ -315,26 +274,157 @@ export default function OfflineInventoryRecovery() {
       ).length;
 
       if (remaining === 0) {
-        setNotice("All queued entries synced successfully.");
+        setNotice("Recovery verified: all queued entries were synced.");
         addEvent("Recovery complete — pending queue is empty", "success");
       } else {
         setNotice(
-          `${remaining} item(s) still pending. Check the API connection and retry sync.`
+          `${remaining} item(s) remain pending. Automatic retry is enabled.`
         );
       }
     } catch (error) {
       setNotice(`Sync error: ${error.message}`);
+      addEvent(`Recovery check failed: ${error.message}`, "error");
     } finally {
       syncingRef.current = false;
       setSyncing(false);
     }
   }, [simulateOffline, refreshQueue, addEvent]);
 
+  // Detect actual browser network changes.
   useEffect(() => {
-    if (!offline) {
-      syncQueue();
+    refreshQueue();
+
+    const onlineHandler = () => {
+      setRealOnline(true);
+
+      addEvent(
+        "Browser network restored — checking pending inventory",
+        "success"
+      );
+    };
+
+    const offlineHandler = () => {
+      setRealOnline(false);
+
+      addEvent(
+        "Browser network lost — inventory will be queued locally",
+        "warning"
+      );
+    };
+
+    window.addEventListener("online", onlineHandler);
+    window.addEventListener("offline", offlineHandler);
+
+    return () => {
+      window.removeEventListener("online", onlineHandler);
+      window.removeEventListener("offline", offlineHandler);
+    };
+  }, [refreshQueue, addEvent]);
+
+  // Automatically retry pending items while online.
+  useEffect(() => {
+    if (offline) {
+      return undefined;
     }
+
+    syncQueue();
+
+    const timer = window.setInterval(() => {
+      if (navigator.onLine && !syncingRef.current) {
+        syncQueue();
+      }
+    }, RETRY_INTERVAL);
+
+    return () => window.clearInterval(timer);
   }, [offline, syncQueue]);
+
+  // Clean up the demo timer if the component is closed.
+  useEffect(() => {
+    return () => {
+      if (demoTimerRef.current) {
+        window.clearTimeout(demoTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Demonstrate automatic recovery without manually clicking Restore.
+  async function runSelfHealingDemo() {
+  if (demoRunning) return;
+
+  setDemoRunning(true);
+  setSimulateOffline(true);
+
+  addEvent(
+    "Failure detected — simulated network interruption",
+    "warning"
+  );
+
+  addEvent(
+    "Offline mode activated — inventory changes will be stored locally",
+    "info"
+  );
+
+  try {
+    const entry = {
+      operationId: makeId(),
+      ingredientName: "Recovery Demo Tomato",
+      quantity: 1,
+      unit: "kg",
+      action: "ADD_STOCK",
+      status: "PENDING",
+      createdAt: new Date().toISOString(),
+      attempts: 0,
+    };
+
+    await savePending(entry);
+    await refreshQueue();
+
+    addEvent(
+      "Offline data added to local queue — Recovery Demo Tomato: 1 kg",
+      "warning"
+    );
+
+    setNotice(
+      "Test inventory operation saved locally. Waiting for automatic recovery..."
+    );
+  } catch (error) {
+    addEvent(
+      `Local queue save failed: ${error.message}`,
+      "error"
+    );
+
+    setNotice(`Could not save demo operation: ${error.message}`);
+    setSimulateOffline(false);
+    setDemoRunning(false);
+    return;
+  }
+
+  demoTimerRef.current = window.setTimeout(() => {
+    addEvent(
+      "Connection restored — starting pending data synchronization",
+      "success"
+    );
+
+    setSimulateOffline(false);
+
+    setNotice(
+      "Connection restored. Pending inventory synchronization starting..."
+    );
+
+    demoTimerRef.current = window.setTimeout(() => {
+      addEvent(
+        "Recovery verification — checking pending inventory queue",
+        "info"
+      );
+
+      setDemoRunning(false);
+      demoTimerRef.current = null;
+
+      syncQueue();
+    }, 1500);
+  }, DEMO_RECOVERY_DELAY);
+}
+
 
   async function addInventory(event) {
     event.preventDefault();
@@ -359,27 +449,47 @@ export default function OfflineInventoryRecovery() {
     };
 
     try {
+      // Store locally first so the entry survives a connection failure.
       await savePending(entry);
+
       await refreshQueue();
+
+      setQuantity("");
 
       setNotice(
         offline
-          ? "Saved locally. Connection restore hone par sync hoga."
-          : "Saved to offline queue. Sync starting..."
+          ? "Entry locally saved. Connection restore hone par automatic sync hogi."
+          : "Entry queued. Automatic sync starting..."
       );
 
       addEvent(
-        `${cleanName}: ${amount} ${unit} saved to local queue`,
+        `Offline data added to local queue — ${cleanName}: ${amount} ${unit}`,
         "warning"
       );
 
-      setQuantity("");
 
       if (!offline) {
         syncQueue();
       }
     } catch (error) {
       setNotice(`Save failed: ${error.message}`);
+    }
+  }
+
+  async function deletePendingItem(operationId) {
+    const confirmed = window.confirm(
+      "Remove this local pending item? It will not be saved to MongoDB."
+    );
+
+    if (!confirmed) return;
+
+    try {
+      await removePending(operationId);
+      await refreshQueue();
+
+      addEvent("Pending item removed manually", "warning");
+    } catch (error) {
+      setNotice(`Delete failed: ${error.message}`);
     }
   }
 
@@ -390,7 +500,8 @@ export default function OfflineInventoryRecovery() {
           <p className="oir-eyebrow">RESILIO · SELF-HEALING SYSTEM</p>
           <h1>Offline Inventory Recovery</h1>
           <p className="oir-subtitle">
-            Queue stock changes offline, then sync safely when the connection returns.
+            Automatically queue inventory changes and retry synchronization
+            when the connection returns.
           </p>
         </div>
 
@@ -413,7 +524,9 @@ export default function OfflineInventoryRecovery() {
             {offline ? "Offline" : "Online"}
           </strong>
           <small>
-            {realOnline ? "Browser network available" : "Browser network unavailable"}
+            {realOnline
+              ? "Browser network available"
+              : "Browser network unavailable"}
           </small>
         </article>
 
@@ -421,41 +534,43 @@ export default function OfflineInventoryRecovery() {
           <span>Sync worker</span>
           <strong>{syncing ? "Running" : "Standby"}</strong>
           <small>
-            {syncing ? "Sending queued operations" : "Waiting for pending work"}
+            {syncing
+              ? "Processing queued operations"
+              : "Automatic retry monitor enabled"}
           </small>
         </article>
       </section>
 
       <section className="oir-panel oir-simulation">
         <div>
-          <h2>Failure simulation</h2>
+          <h2>Automatic Self-Healing Demo</h2>
           <p>
-            Demo ke liye simulated offline mode on karo. Isse browser ka actual internet disconnect nahi hota.
+            Failure simulate hoga. {DEMO_RECOVERY_DELAY / 1000} seconds baad
+            app automatically recovery start karega.
+          </p>
+          <p>
+            {demoRunning
+              ? "Failure detected — recovery in progress..."
+              : "System demo ke liye ready hai."}
           </p>
         </div>
 
         <button
-          className={`oir-toggle ${simulateOffline ? "active" : ""}`}
-          onClick={() => {
-            const next = !simulateOffline;
-            setSimulateOffline(next);
-
-            addEvent(
-              next ? "Simulated network failure injected" : "Simulated connection restored",
-              next ? "warning" : "success"
-            );
-          }}
+          className={`oir-toggle ${demoRunning ? "active" : ""}`}
           type="button"
+          disabled={demoRunning}
+          onClick={runSelfHealingDemo}
         >
-          {simulateOffline ? "Restore Connection" : "Simulate Offline"}
+          {demoRunning ? "Recovering..." : "Run Self-Healing Demo"}
         </button>
       </section>
 
       <div className="oir-columns">
         <section className="oir-panel">
           <h2>Add inventory while offline</h2>
+
           <p className="oir-muted">
-            Entry is saved to this browser first, even when the network is unavailable.
+            Entry is saved locally first. Automatic sync handles recovery.
           </p>
 
           <form onSubmit={addInventory} className="oir-form">
@@ -485,7 +600,10 @@ export default function OfflineInventoryRecovery() {
 
               <label>
                 Unit
-                <select value={unit} onChange={(event) => setUnit(event.target.value)}>
+                <select
+                  value={unit}
+                  onChange={(event) => setUnit(event.target.value)}
+                >
                   <option value="kg">kg</option>
                   <option value="g">g</option>
                   <option value="litre">litre</option>
@@ -515,14 +633,19 @@ export default function OfflineInventoryRecovery() {
           </button>
 
           <p className="oir-footnote">
-            Sync endpoint configured as <code>{SYNC_ENDPOINT}</code>. Your Express backend must implement this endpoint before queued data can reach MongoDB.
+            Endpoint: <code>{SYNC_ENDPOINT}</code>
           </p>
         </section>
 
         <section className="oir-panel">
           <div className="oir-panel-heading">
             <h2>Pending inventory queue</h2>
-            <button className="oir-text-button" onClick={refreshQueue} type="button">
+
+            <button
+              className="oir-text-button"
+              onClick={refreshQueue}
+              type="button"
+            >
               Refresh
             </button>
           </div>
@@ -531,7 +654,7 @@ export default function OfflineInventoryRecovery() {
             <div className="oir-empty">
               <span>✓</span>
               <strong>Queue is clear</strong>
-              <p>Offline entries yahan dikhengi.</p>
+              <p>Pending offline entries yahan dikhenge.</p>
             </div>
           ) : (
             <div className="oir-queue">
@@ -539,14 +662,21 @@ export default function OfflineInventoryRecovery() {
                 <article className="oir-queue-item" key={item.operationId}>
                   <div>
                     <strong>{item.ingredientName}</strong>
+
                     <p>
                       {item.quantity} {item.unit} · {formatTime(item.createdAt)}
                     </p>
-                    <small>{item.lastError || `Attempts: ${item.attempts || 0}`}</small>
+
+                    <small>
+                      {item.lastError || `Attempts: ${item.attempts || 0}`}
+                    </small>
                   </div>
 
                   <div className="oir-queue-item-actions">
-                    <span className={`oir-chip ${item.status === "SYNCING" ? "syncing" : "pending"}`}>
+                    <span
+                      className={`oir-chip ${item.status === "SYNCING" ? "syncing" : "pending"
+                        }`}
+                    >
                       {item.status === "SYNCING" ? "SYNCING" : "PENDING"}
                     </span>
 
@@ -574,8 +704,12 @@ export default function OfflineInventoryRecovery() {
 
         <div className="oir-timeline">
           {events.map((event, index) => (
-            <div className={`oir-event ${event.kind}`} key={`${event.time}-${index}`}>
+            <div
+              className={`oir-event ${event.kind}`}
+              key={`${event.time}-${index}`}
+            >
               <span className="oir-event-dot" />
+
               <div>
                 <strong>{event.label}</strong>
                 <time>{formatTime(event.time)}</time>
@@ -586,7 +720,9 @@ export default function OfflineInventoryRecovery() {
       </section>
 
       <p className="oir-disclaimer">
-        Safety note: this page queues stock-add operations only. The backend must validate ingredient identity, authenticate admin access, and use operationId for idempotency to prevent duplicate stock changes.
+        This demo simulates recovery inside the application. It does not
+        physically disconnect or restore the laptop's Wi-Fi. A sync is
+        successful only when the backend confirms the database operation.
       </p>
     </main>
   );
